@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from einops import rearrange
+from einops import rearrange, repeat
 from torch import Tensor
 import math
 
@@ -123,7 +123,7 @@ class DataEmbeddingWithExoPromptTuning(nn.Module):
         embed_type="fixed",
         freq="h",
         dropout=0.1,
-        prompt_tuning_type="two_layer_mlp",
+        prompt_tuning_type="two_layer_mlp",  # two_layer_mlp, brute_concat
         num_virtual_tokens: int = 10,
         exo_prompt_dim: int = 241,
         exo_prompt_projector_hidden_size: int = 512,
@@ -135,8 +135,11 @@ class DataEmbeddingWithExoPromptTuning(nn.Module):
         self.exo_prompt_dim = exo_prompt_dim
         self.exo_prompt_projector = nn.Identity()
         self.exo_prompt_projector_hidden_size = exo_prompt_projector_hidden_size
+
         match prompt_tuning_type:
             case "two_layer_mlp":
+                # inspired from prefix-tuning
+                # https://github.dev/huggingface/peft/blob/main/src/peft/peft_model.py
                 self.exo_prompt_projector = torch.nn.Sequential(
                     torch.nn.Linear(exo_prompt_dim, exo_prompt_projector_hidden_size),
                     torch.nn.Tanh(),
@@ -144,12 +147,21 @@ class DataEmbeddingWithExoPromptTuning(nn.Module):
                         exo_prompt_projector_hidden_size, d_model * num_virtual_tokens
                     ),
                 )
+            case "brute_concat":
+                self.exo_prompt_projector = None
             case _:
                 raise ValueError(
                     f"prompt_tuning_type {prompt_tuning_type} is not supported."
                 )
 
-        self.value_embedding = TokenEmbedding(c_in=c_in, d_model=d_model)
+        token_embedding_c_in = (
+            c_in
+            if self.prompt_tuning_type not in ["brute_concat"]
+            else c_in + exo_prompt_dim
+        )
+        self.value_embedding = TokenEmbedding(
+            c_in=token_embedding_c_in, d_model=d_model
+        )
         self.position_embedding = PositionalEmbedding(d_model=d_model)
         self.temporal_embedding = (
             TemporalEmbedding(d_model=d_model, embed_type=embed_type, freq=freq)
@@ -159,23 +171,40 @@ class DataEmbeddingWithExoPromptTuning(nn.Module):
         self.dropout = nn.Dropout(p=dropout)
 
     def forward(self, x, x_mark, exo_prompt: Tensor):
-        exo_prompt = self.exo_prompt_projector(exo_prompt)
-        exo_prompt = rearrange(
-            exo_prompt, "b (l d) -> b l d", l=self.num_virtual_tokens
-        )
+        if self.prompt_tuning_type in ["brute_concat"]:
+            exo_prompt = repeat(exo_prompt, "b v -> b l v", l=x.size(1))
+        elif self.prompt_tuning_type in ["two_layer_mlp"]:
+            exo_prompt = self.exo_prompt_projector(exo_prompt)
+            exo_prompt = rearrange(
+                exo_prompt, "b (l d) -> b l d", l=self.num_virtual_tokens
+            )
+
         if x_mark is None:
-            x = self.value_embedding(x)
-            x = torch.cat([exo_prompt, x], dim=1)
+            if self.prompt_tuning_type in ["brute_concat"]:
+                x = torch.cat([exo_prompt, x], dim=2)
+                x = self.value_embedding(x)
+            else:
+                x = self.value_embedding(x)
+                x = torch.cat([exo_prompt, x], dim=1)
             x = x + self.position_embedding(x)
         else:
-            x = self.value_embedding(x)  # [B, L, D]
-            x = torch.cat([exo_prompt, x], dim=1)  # [B, (V + L), D]
+            if self.prompt_tuning_type in ["brute_concat"]:
+                x = torch.cat([exo_prompt, x], dim=2)  # [B, L, (V + I_S)]
+                x = self.value_embedding(x)  # [B, L, D]
+            else:
+                x = self.value_embedding(x)  # [B, L, D]
+                x = torch.cat([exo_prompt, x], dim=1)  # [B, (V + L), D]
             x = x + self.position_embedding(x)
-            temporal_filler = torch.zeros_like(exo_prompt)
-            temporal_embedding = torch.cat(
-                [temporal_filler, self.temporal_embedding(x_mark)], dim=1
-            )
+
+            # handling temporal embedding
+            temporal_embedding = self.temporal_embedding(x_mark)
+            if self.prompt_tuning_type not in ["brute_concat"]:
+                temporal_filler = torch.zeros_like(exo_prompt)
+                temporal_embedding = torch.cat(
+                    [temporal_filler, temporal_embedding], dim=1
+                )
             x = x + temporal_embedding
+
         return self.dropout(x)
 
 

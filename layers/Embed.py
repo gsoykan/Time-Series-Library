@@ -3,6 +3,7 @@ import torch.nn as nn
 from einops import rearrange, repeat
 from torch import Tensor
 import math
+import torch.nn.functional as F
 
 
 class PositionalEmbedding(nn.Module):
@@ -125,7 +126,7 @@ class DataEmbeddingWithExoPromptTuning(nn.Module):
         dropout=0.1,
         prompt_tuning_type="two_layer_mlp",  # two_layer_mlp, brute_concat
         num_virtual_tokens: int = 10,
-        exo_prompt_dim: int = 241,
+        exo_prompt_dim: int = 254,
         exo_prompt_projector_hidden_size: int = 512,
     ):
         super(DataEmbeddingWithExoPromptTuning, self).__init__()
@@ -204,6 +205,103 @@ class DataEmbeddingWithExoPromptTuning(nn.Module):
                     [temporal_filler, temporal_embedding], dim=1
                 )
             x = x + temporal_embedding
+
+        return self.dropout(x)
+
+
+class DataEmbedding_inverted_WithExoPromptTuning(nn.Module):
+    def __init__(
+        self,
+        c_in,  # in this context c_in is seq_len because we permute
+        d_model,
+        embed_type="fixed",
+        freq="h",
+        dropout=0.1,
+        prompt_tuning_type="two_layer_mlp",  # two_layer_mlp, brute_concat
+        num_virtual_tokens: int = 10,
+        exo_prompt_dim: int = 254,
+        exo_prompt_projector_hidden_size: int = 512,
+    ):
+        super(DataEmbedding_inverted_WithExoPromptTuning, self).__init__()
+
+        self.prompt_tuning_type = prompt_tuning_type
+        self.num_virtual_tokens = num_virtual_tokens
+        self.exo_prompt_dim = exo_prompt_dim
+        self.exo_prompt_projector = nn.Identity()
+        self.exo_prompt_projector_hidden_size = exo_prompt_projector_hidden_size
+
+        match prompt_tuning_type:
+            case "two_layer_mlp":
+                # inspired from prefix-tuning
+                # https://github.dev/huggingface/peft/blob/main/src/peft/peft_model.py
+                self.exo_prompt_projector = torch.nn.Sequential(
+                    torch.nn.Linear(exo_prompt_dim, exo_prompt_projector_hidden_size),
+                    torch.nn.Tanh(),
+                    torch.nn.Linear(
+                        exo_prompt_projector_hidden_size, d_model * num_virtual_tokens
+                    ),
+                )
+            case "brute_concat":
+                self.exo_prompt_projector = None
+            case _:
+                raise ValueError(
+                    f"prompt_tuning_type {prompt_tuning_type} is not supported."
+                )
+
+        token_embedding_c_in = (
+            c_in
+            if self.prompt_tuning_type not in ["brute_concat"]
+            else c_in + exo_prompt_dim
+        )
+        self.value_embedding = nn.Linear(token_embedding_c_in, d_model)
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(
+        self,
+        x,  # [B L (seq_len) V (variate)]
+        x_mark,  # [B L (seq_len) F (num_features (5))]
+        exo_prompt: Tensor,
+    ):
+        # x: [B L V]
+        x = x.permute(0, 2, 1)
+        # x: [Batch Variate Time]
+
+        if self.prompt_tuning_type in ["brute_concat"]:
+            exo_prompt = repeat(
+                exo_prompt, "b v -> b l v", l=x.size(1)
+            )  # l here is num_variate, [B Variate Params]
+        elif self.prompt_tuning_type in ["two_layer_mlp"]:
+            exo_prompt = self.exo_prompt_projector(exo_prompt)
+            exo_prompt = rearrange(
+                exo_prompt, "b (l d) -> b l d", l=self.num_virtual_tokens
+            )  # [B L d_model]
+
+        if x_mark is None:
+            if self.prompt_tuning_type in ["brute_concat"]:
+                x = torch.cat([x, exo_prompt], dim=2)
+                x = self.value_embedding(x)
+            else:
+                x = self.value_embedding(x)  # [Batch Variate d_model]
+                x = torch.cat(
+                    [x, exo_prompt], dim=1
+                )  # [Batch (num_virtual + Variate) d_model]
+        else:
+            x_mark_i = x_mark.permute(0, 2, 1)  # [B F L]
+            if self.prompt_tuning_type in ["brute_concat"]:
+                # TODO: @gsoykan - debug this there should be error...
+                x = torch.cat([x, exo_prompt], dim=2)  # [B Variate (L + I_S)]
+                # padding x_mark_i dim 2 so that they can be catted along dim 1
+                pad_length = x.size(2) - x_mark_i.size(2)
+                x_mark_i = F.pad(x_mark_i, (0, pad_length))
+                x = self.value_embedding(
+                    torch.cat([x, x_mark_i], 1)
+                )  # [Batch Variate d_model], Variate (actual_variate + time)
+            else:
+                # x = self.value_embedding(torch.cat([x, x_mark_i], 1))
+                x = self.value_embedding(
+                    torch.cat([x, x_mark_i], 1)
+                )  # [Batch (Variate + F) d_model]
+                x = torch.cat([x, exo_prompt], dim=1)  # [B, (V + F + L), D]
 
         return self.dropout(x)
 

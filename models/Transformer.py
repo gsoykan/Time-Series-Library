@@ -4,9 +4,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from layers.Transformer_EncDec import Decoder, DecoderLayer, Encoder, EncoderLayer
-from layers.SelfAttention_Family import FullAttention, AttentionLayer
-from layers.Embed import DataEmbedding, DataEmbeddingWithExoPromptTuning
+from ..layers.Transformer_EncDec import Decoder, DecoderLayer, Encoder, EncoderLayer
+from ..layers.SelfAttention_Family import FullAttention, AttentionLayer
+from ..layers.Embed import DataEmbedding, DataEmbeddingWithExoPromptTuning
 
 
 class Model(nn.Module):

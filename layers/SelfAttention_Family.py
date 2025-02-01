@@ -66,6 +66,10 @@ class FullAttention(nn.Module):
 
             scores.masked_fill_(attn_mask.mask, -np.inf)
 
+        # todo: @gsoykan - to fix the numerical instability
+        scores = scores - scores.max(dim=-1, keepdim=True)[0]  # Prevent overflow
+        scores = torch.clamp(scores, min=-50, max=50)  # Ensure numerical stability
+
         A = self.dropout(torch.softmax(scale * scores, dim=-1))
         V = torch.einsum("bhls,bshd->blhd", A, values)
 
